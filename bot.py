@@ -1,17 +1,21 @@
 import logging
 import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, ConversationHandler, filters
+)
 
-# === CONFIG ===
-TOKEN = "7308877263:AAEuz6pumYmjbeMyJ76GBYGJVvnDLXiubY4"  # <<<< এখানে তোমার বটের টোকেন দিবি (@BotFather থেকে)
-ADMIN_ID = 1651695602  # <<<< তোমার টেলিগ্রাম আইডি দে (admin হিসেবে)
+# === তোমার তথ্য ===
+TOKEN = "7308877263:AAEuz6pumYmjbeMyJ76GBYGJVvnDLXiubY4"
+ADMIN_ID = 1651695602
 
-# Logging
+# Conversation states for deposit
+WAITING_SCREENSHOT, WAITING_TRXID, WAITING_AMOUNT = range(3)
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database init
 def init_db():
     conn = sqlite3.connect('proxy_bot.db')
     c = conn.cursor()
@@ -31,6 +35,7 @@ def init_db():
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER,
                     amount INTEGER,
+                    trxid TEXT,
                     status TEXT DEFAULT 'pending',
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )''')
@@ -43,7 +48,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# === Helper Functions ===
+# Helper functions
 def get_balance(user_id):
     conn = sqlite3.connect('proxy_bot.db')
     c = conn.cursor()
@@ -63,9 +68,9 @@ def get_available_proxies():
     conn = sqlite3.connect('proxy_bot.db')
     c = conn.cursor()
     c.execute("SELECT ip_port, username, password FROM proxies WHERE sold = 0")
-    proxies = c.fetchall()
+    rows = c.fetchall()
     conn.close()
-    return proxies
+    return rows
 
 def mark_proxy_sold(ip_port):
     conn = sqlite3.connect('proxy_bot.db')
@@ -74,7 +79,7 @@ def mark_proxy_sold(ip_port):
     conn.commit()
     conn.close()
 
-# === Handlers ===
+# Start command & main menu
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user.id, user.username)
@@ -82,63 +87,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💰 Balance", callback_data="balance")],
         [InlineKeyboardButton("🛒 Buy Proxy", callback_data="buy")],
-        [InlineKeyboardButton("💸 Deposit", callback_data="deposit")],
+        [InlineKeyboardButton("💵 Deposit", callback_data="deposit")],
         [InlineKeyboardButton("📦 My Proxies", callback_data="my_proxies")],
     ]
     if user.id == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")])
+        keyboard.append([InlineKeyboardButton("Admin Panel", callback_data="admin")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        f"🌟 স্বাগতম {user.first_name}!\n\n"
-        "এটি একটি Residential Proxy Selling Bot\n"
-        "১টি প্রক্সি = ১ টাকা (১ পয়েন্ট)\n\n"
-        "নিচে থেকে অপশন বেছে নিন 👇",
-        reply_markup=reply_markup
-    )
 
+    text = f"স্বাগতম {user.first_name}!\n\nResidential Proxy Shop\n১ প্রক্সি = ১ টাকা (১ পয়েন্ট)\n\nকি করতে চাও?"
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+
+# Button handler
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    data = query.data
 
-    if query.data == "balance":
+    if data == "balance":
         bal = get_balance(user_id)
-        await query.edit_message_text(f"💰 তোমার ব্যালেন্স: {bal} পয়েন্ট (টাকা)")
+        await query.edit_message_text(f"তোমার ব্যালেন্স: {bal} পয়েন্ট (টাকা)")
 
-    elif query.data == "buy":
+    elif data == "my_proxies":
+        conn = sqlite3.connect('proxy_bot.db')
+        c = conn.cursor()
+        c.execute("SELECT proxy, timestamp FROM purchases WHERE user_id = ? ORDER BY id DESC LIMIT 20", (user_id,))
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            await query.edit_message_text("তুমি এখনো কোনো প্রক্সি কেনোনি।")
+            return
+        text = "তোমার কেনা প্রক্সিগুলো:\n\n"
+        for proxy, time in rows:
+            text += f"`{proxy}`\n"
+        await query.edit_message_text(text, parse_mode='Markdown')
+
+    elif data == "buy":
         proxies = get_available_proxies()
         if not proxies:
-            await query.edit_message_text("😞 বর্তমানে কোনো প্রক্সি স্টকে নেই। পরে চেক করো।")
+            await query.edit_message_text("বর্তমানে স্টকে কোনো প্রক্সি নেই। পরে চেক করো।")
             return
+        keyboard = [
+            [InlineKeyboardButton("১টি কিনুন – ১ টাকা", callback_data="buy_1")],
+            [InlineKeyboardButton("৫টি কিনুন – ৫ টাকা", callback_data="buy_5")],
+            [InlineKeyboardButton("১০টি কিনুন – ১০ টাকা", callback_data="buy_10")],
+            [InlineKeyboardButton("পিছনে", callback_data="back")],
+        ]
+        await query.edit_message_text("কতগুলো প্রক্সি কিনবে?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-        keyboard = []
-        keyboard.append([InlineKeyboardButton("১টি কিনুন (১ টাকা)", callback_data="buy_1")])
-        keyboard.append([InlineKeyboardButton("৫টি কিনুন (৫ টাকা)", callback_data="buy_5")])
-        keyboard.append([InlineKeyboardButton("১০টি কিনুন (১০ টাকা)", callback_data="buy_10")])
-        keyboard.append([InlineKeyboardButton("🔙 পিছনে", callback_data="back")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("🛒 কতগুলো প্রক্সি কিনবে?", reply_markup=reply_markup)
-
-    elif query.data.startswith("buy_"):
-        count = int(query.data.split("_")[1])
+    elif data.startswith("buy_"):
+        count = int(data.split("_")[1])
         bal = get_balance(user_id)
         if bal < count:
-            await query.edit_message_text(f"❌ অপর্যাপ্ত ব্যালেন্স! দরকার: {count} টাকা, আছে: {bal} টাকা")
+            await query.edit_message_text(f"অপর্যাপ্ত ব্যালেন্স!\nদরকার: {count} Tk, আছে: {bal} Tk")
             return
 
         proxies = get_available_proxies()[:count]
         if len(proxies) < count:
-            await query.edit_message_text("😞 এতগুলো প্রক্সি স্টকে নেই।")
+            await query.edit_message_text("এতগুলো প্রক্সি এখন স্টকে নেই।")
             return
 
-        result = "✅ সফলভাবে কেনা হয়েছে!\n\nতোমার প্রক্সিগুলো:\n\n"
+        result = "সফলভাবে কেনা হয়েছে!\n\nতোমার প্রক্সিগুলো:\n\n"
         for ip_port, user, pwd in proxies:
-            proxy_str = f"http://{user}:{pwd}@{ip_port}" if user and pwd else ip_port
+            proxy_str = f"http://{user}:{pwd}@{ip_port" if user and pwd else ip_port
             result += f"`{proxy_str}`\n"
             mark_proxy_sold(ip_port)
 
-            # Save purchase
             conn = sqlite3.connect('proxy_bot.db')
             c = conn.cursor()
             c.execute("INSERT INTO purchases (user_id, proxy) VALUES (?, ?)", (user_id, proxy_str))
@@ -152,123 +171,111 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        await query.edit_message_text(result + f"\n💸 ব্যালেন্স কাটা হয়েছে: {count} টাকা", parse_mode='Markdown')
+        await query.edit_message_text(result + f"\n{bundle} টাকা কাটা হয়েছে।", parse_mode='Markdown')
 
-    elif query.data == "deposit":
-        await query.edit_message_text(
-            "💸 ডিপোজিট করতে চাইলে নিচের মাধ্যমে টাকা পাঠাও এবং স্ক্রিনশট/ট্রানজেকশন আইডি দিয়ে /deposit <amount> লিখে পাঠাও।\n\n"
-            "উদাহরণ: `/deposit 500`\n\n"
-            "বিকাশ/নগদ/রকেট: 01xxxxxxxxx (Personal)\n"
-            "অ্যাডমিন অ্যাপ্রুভ করলে পয়েন্ট যোগ হয়ে যাবে।",
-            parse_mode='Markdown'
-        )
+    elif data == "back":
+        await start(query, context)
 
-    elif query.data == "my_proxies":
+    # Admin approve deposit
+    elif data.startswith("approve_"):
+        parts = data.split("_")
+        target_user_id = int(parts[1])
+        amount = int(parts[2])
+
         conn = sqlite3.connect('proxy_bot.db')
         c = conn.cursor()
-        c.execute("SELECT proxy, timestamp FROM purchases WHERE user_id = ? ORDER BY timestamp DESC LIMIT 20", (user_id,))
-        rows = c.fetchall()
+        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_user_id))
+        c.execute("UPDATE deposits SET status = 'approved' WHERE user_id = ? AND amount = ? AND status = 'pending'",
+                  (target_user_id, amount))
+        conn.commit()
         conn.close()
 
-        if not rows:
-            await query.edit_message_text("📦 তোমার কোনো প্রক্সি কেনা হয়নি এখনো।")
-            return
+        await context.bot.send_message(target_user_id, f"তোমার {amount} Tk এর ডিপোজিট অ্যাপ্রুভ হয়েছে! ব্যালেন্সে যোগ হয়েছে।")
+        await query.edit_message_caption(caption=query.message.caption + f"\n\nApproved | +{amount} Point")
 
-        text = "📦 তোমার কেনা প্রক্সিগুলো (সাম্প্রতিক ২০টি):\n\n"
-        for proxy, time in rows:
-            text += f"`{proxy}` - {time[:10]}\n"
-        await query.edit_message_text(text, parse_mode='Markdown')
+# Deposit conversation
+async def deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Deposit করতে নিচের নাম্বারে বিকাশ করো:\n\n"
+        "বিকাশ: `01815243007` (তোমার নাম্বার দে)\n\n"
+        "পেমেন্ট করার পর স্ক্রিনশট এখানে পাঠাও →",
+        parse_mode='Markdown'
+    )
+    return WAITING_SCREENSHOT
 
-    elif query.data == "admin" and user_id == ADMIN_ID:
-        keyboard = [
-            [InlineKeyboardButton("📥 Pending Deposits", callback_data="pending_deposits")],
-            [InlineKeyboardButton("➕ Add Proxies", callback_data="add_proxies")],
-            [InlineKeyboardButton("📊 Stats", callback_data="stats")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("⚙️ অ্যাডমিন প্যানেল", reply_markup=reply_markup)
+async def received_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+    elif update.message.document:
+        file_id = update.message.document.file_id
+    else:
+        await update.message.reply_text("শুধু ছবি/স্ক্রিনশট পাঠাও।")
+        return WAITING_SCREENSHOT
 
-    elif query.data == "pending_deposits" and user_id == ADMIN_ID:
-        conn = sqlite3.connect('proxy_bot.db')
-        c = conn.cursor()
-        c.execute("SELECT id, user_id, amount FROM deposits WHERE status='pending'")
-        rows = c.fetchall()
-        conn.close()
+    context.user_data['screenshot'] = file_id
+    await update.message.reply_text("ধন্যবাদ! এখন Transaction ID দাও:")
+    return WAITING_TRXID
 
-        if not rows:
-            await query.edit_message_text("✅ কোনো পেন্ডিং ডিপোজিট নেই।")
-            return
+async def received_trxid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['trxid'] = update.message.text.strip()
+    await update.message.reply_text("কত টাকা পাঠিয়েছ? (শুধু সংখ্যা লিখো)")
+    return WAITING_AMOUNT
 
-        keyboard = []
-        for dep_id, uid, amt in rows:
-            keyboard.append([InlineKeyboardButton(f"✅ Approve {amt} Tk - {uid}", callback_data=f"approve_{dep_id}")])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("📥 পেন্ডিং ডিপোজিটস:", reply_markup=reply_markup)
-
-    elif query.data.startswith("approve_") and user_id == ADMIN_ID:
-        dep_id = query.data.split("_")[1]
-        conn = sqlite3.connect('proxy_bot.db')
-        c = conn.cursor()
-        c.execute("SELECT user_id, amount FROM deposits WHERE id=?", (dep_id,))
-        row = c.fetchone()
-        if row:
-            uid, amt = row
-            c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amt, uid))
-            c.execute("UPDATE deposits SET status='approved' WHERE id=?", (dep_id,))
-            conn.commit()
-            await context.bot.send_message(uid, f"✅ তোমার {amt} টাকার ডিপোজিট অ্যাপ্রুভ হয়েছে! ব্যালেন্সে যোগ হয়েছে।")
-        conn.close()
-        await query.edit_message_text("✅ ডিপোজিট অ্যাপ্রুভ করা হয়েছে।")
-
-    elif query.data == "back":
-        await start(query, context)  # restart start menu
-
-# Deposit command (user sends /deposit 500)
-async def deposit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1:
-        await update.message.reply_text("❌ ব্যবহার: /deposit <amount>\nউদাহরণ: /deposit 500")
-        return
+async def received_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = int(context.args[0])
+        amount = int(update.message.text.strip())
         if amount < 50:
-            await update.message.reply_text("❌ ন্যূনতম ৫০ টাকা")
-            return
+            await update.message.reply_text("ন্যূনতম ৫০ টাকা। আবার লিখো।")
+            return WAITING_AMOUNT
     except:
-        await update.message.reply_text("❌ সঠিক পরিমাণ দাও")
-        return
+        await update.message.reply_text("শুধু সংখ্যা লিখো।")
+        return WAITING_AMOUNT
 
-    user_id = update.effective_user.id
+    user = update.effective_user
+    screenshot = context.user_data['screenshot']
+    trxid = context.user_data['trxid']
+
+    # Save request
     conn = sqlite3.connect('proxy_bot.db')
     c = conn.cursor()
-    c.execute("INSERT INTO deposits (user_id, amount) VALUES (?, ?)", (user_id, amount))
+    c.execute("INSERT INTO deposits (user_id, amount, trxid) VALUES (?, ?, ?)", (user.id, amount, trxid))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
-        f"✅ ডিপোজিট রিকোয়েস্ট পাঠানো হয়েছে: {amount} টাকা\n"
-        "অ্যাডমিন অ্যাপ্রুভ করলে পয়েন্ট যোগ হয়ে যাবে।"
+    # Notify admin
+    keyboard = [[InlineKeyboardButton(f"Approve {amount} Tk", callback_data=f"approve_{user.id}_{amount}")]]
+    await context.bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=screenshot,
+        caption=f"New Deposit!\n\n"
+                f"User: {user.full_name} (@{user.username or 'N/A'})\n"
+                f"ID: `{user.id}`\n"
+                f"Amount: {amount} Tk\n"
+                f"TrxID: `{trxid}`",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    await context.bot.send_message(ADMIN_ID, f"🔔 নতুন ডিপোজিট রিকোয়েস্ট!\nUser: {user_id}\nAmount: {amount} Tk\n/deposit টাইপ করে চেক করো।")
 
-# Admin: Add proxies manually (text file or message)
-async def add_proxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"{amount} Tk এর রিকোয়েস্ট পাঠানো হয়েছে। অ্যাডমিন অ্যাপ্রুভ করলে পয়েন্ট যোগ হবে।")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# Admin: Add proxies
+async def add_proxies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     await update.message.reply_text(
-        "প্রক্সি যোগ করতে একেক লাইনে একটা করে পাঠাও। ফরম্যাট:\n"
+        "প্রক্সি যোগ করো। এক লাইনে একটা:\n"
         "ip:port\n"
         "অথবা\n"
-        "ip:port:user:pass\n\n"
-        "উদাহরণ:\n"
-        "123.45.67.89:8080:user123:pass456"
+        "ip:port:user:pass"
     )
-    context.user_data['adding_proxies'] = True
+    context.user_data['adding'] = True
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('adding_proxies') and update.effective_user.id == ADMIN_ID:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('adding') and update.effective_user.id == ADMIN_ID:
         lines = update.message.text.strip().split('\n')
         added = 0
         conn = sqlite3.connect('proxy_bot.db')
@@ -278,36 +285,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not line: continue
             parts = line.split(':')
             if len(parts) == 2:
-                ip_port, = parts
-                username = password = None
+                ip_port, = parts[0] + ':' + parts[1]
+                user = pwd = None
             elif len(parts) == 4:
-                ip_port, _, username, password = parts
+                ip_port = parts[0] + ':' + parts[1]
+                user, pwd = parts[2], parts[3]
             else:
                 continue
-
-            try:
-                c.execute("INSERT OR IGNORE INTO proxies (ip_port, username, password) VALUES (?, ?, ?)",
-                          (ip_port, username, password))
-                added += 1
-            except:
-                pass
+            c.execute("INSERT OR IGNORE INTO proxies (ip_port, username, password) VALUES (?, ?, ?)",
+                      (ip_port, user, pwd))
+            added += c.rowcount
         conn.commit()
         conn.close()
-
-        await update.message.reply_text(f"✅ {added} টি প্রক্সি স্টকে যোগ করা হয়েছে!")
-        context.user_data['adding_proxies'] = False
+        await update.message.reply_text(f"{added} টি প্রক্সি যোগ হয়েছে!")
+        context.user_data['adding'] = False
 
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
 
+    # Deposit conversation
+    deposit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit$")],
+        states={
+            WAITING_SCREENSHOT: [MessageHandler(filters.PHOTO | filters.DOCUMENT, received_screenshot)],
+            WAITING_TRXID: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_trxid)],
+            WAITING_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_amount)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CommandHandler("deposit", deposit_command))
-    app.add_handler(CommandHandler("addproxies", add_proxies_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(deposit_conv)
+    app.add_handler(CommandHandler("addproxies", add_proxies))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("Bot চালু হয়েছে...")
+    print("Bot চালু হয়েছে! @তোমারবটইউজারনেম")
     app.run_polling()
 
 if __name__ == '__main__':
